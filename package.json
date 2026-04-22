@@ -14,9 +14,13 @@
   ],
   "activationEvents": [
     "onCommand:geminiAgent.openChat",
+    "onCommand:geminiAgent.openNativeChat",
     "onCommand:geminiAgent.resetSession",
     "onCommand:geminiAgent.setApiKey",
+    "onCommand:geminiAgent.setBaseUrl",
     "onCommand:geminiAgent.clearApiKey",
+    "onCommand:geminiAgent.clearBaseUrl",
+    "onView:geminiAgent.sidebar",
     "onChatParticipant:local.gemini-vscode-agent"
   ],
   "main": "./out/extension.js",
@@ -27,6 +31,10 @@
         "title": "Gemini Agent: Open Chat"
       },
       {
+        "command": "geminiAgent.openNativeChat",
+        "title": "Gemini Agent: Open Native Chat"
+      },
+      {
         "command": "geminiAgent.resetSession",
         "title": "Gemini Agent: Reset Session"
       },
@@ -35,10 +43,36 @@
         "title": "Gemini Agent: Set API Key"
       },
       {
+        "command": "geminiAgent.setBaseUrl",
+        "title": "Gemini Agent: Set Base URL"
+      },
+      {
         "command": "geminiAgent.clearApiKey",
         "title": "Gemini Agent: Clear API Key"
+      },
+      {
+        "command": "geminiAgent.clearBaseUrl",
+        "title": "Gemini Agent: Clear Base URL"
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "geminiAgent",
+          "title": "Gemini Agent",
+          "icon": "media/gemini.svg"
+        }
+      ]
+    },
+    "views": {
+      "geminiAgent": [
+        {
+          "type": "webview",
+          "id": "geminiAgent.sidebar",
+          "name": "Chat"
+        }
+      ]
+    },
     "chatParticipants": [
       {
         "id": "local.gemini-vscode-agent",
@@ -55,6 +89,20 @@
           "type": "string",
           "default": "",
           "markdownDescription": "Gemini API key. If empty, the extension will also check the `GEMINI_API_KEY` environment variable."
+        },
+        "geminiAgent.apiStyle": {
+          "type": "string",
+          "default": "gemini",
+          "enum": [
+            "gemini",
+            "openai-compatible"
+          ],
+          "description": "Choose the native Gemini API or an OpenAI-compatible endpoint such as Timeweb Cloud AI agents."
+        },
+        "geminiAgent.baseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Base URL for OpenAI-compatible mode, for example a Timeweb OpenAI URL without the trailing /v1/chat/completions part."
         },
         "geminiAgent.model": {
           "type": "string",
@@ -78,13 +126,34 @@
           "description": "Maximum file size the agent can read in one tool call."
         }
       }
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "geminiAgent.setApiKey",
+          "when": "view == geminiAgent.sidebar",
+          "group": "navigation"
+        },
+        {
+          "command": "geminiAgent.setBaseUrl",
+          "when": "view == geminiAgent.sidebar",
+          "group": "navigation"
+        },
+        {
+          "command": "geminiAgent.resetSession",
+          "when": "view == geminiAgent.sidebar",
+          "group": "navigation"
+        }
+      ]
     }
   },
   "scripts": {
     "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "watch": "tsc -watch -p ./",
+    "package:vsix": "vsce package"
   },
   "devDependencies": {
+    "@vscode/vsce": "^3.6.2",
     "@types/node": "^20.14.10",
     "@types/vscode": "^1.90.0",
     "typescript": "^5.5.4"

@@ -4,9 +4,11 @@ import * as path from "node:path";
 
 const PARTICIPANT_ID = "local.gemini-vscode-agent";
 const PARTICIPANT_NAME = "gemini";
+const WEBVIEW_ID = "geminiAgent.sidebar";
+const API_KEY_SECRET = "geminiAgent.apiKey";
+const BASE_URL_SECRET = "geminiAgent.baseUrl";
 const DEFAULT_MODEL = "gemini-2.5-flash";
 const MAX_TOOL_ITERATIONS = 8;
-const API_KEY_SECRET = "geminiAgent.apiKey";
 
 const SYSTEM_PROMPT = [
   "You are a coding agent running inside Visual Studio Code.",
@@ -53,14 +55,60 @@ type GeminiResponse = {
   };
 };
 
+type OpenAIChatMessage =
+  | { role: "system" | "user" | "assistant"; content?: string | null; tool_calls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> }
+  | { role: "tool"; content: string; tool_call_id: string };
+
+type OpenAIResponse = {
+  choices?: Array<{
+    message?: {
+      content?: string | null;
+      tool_calls?: Array<{
+        id: string;
+        type: "function";
+        function: {
+          name: string;
+          arguments: string;
+        };
+      }>;
+    };
+    delta?: {
+      content?: string;
+      tool_calls?: Array<{
+        index: number;
+        id?: string;
+        type?: "function";
+        function?: {
+          name?: string;
+          arguments?: string;
+        };
+      }>;
+    };
+    finish_reason?: string | null;
+  }>;
+  error?: {
+    message?: string;
+  };
+};
+
 type ToolResultPayload = {
   ok: boolean;
   content?: unknown;
   error?: string;
 };
 
+type ChatLogMessage = {
+  role: "user" | "assistant" | "system";
+  text: string;
+};
+
+type AgentStream = {
+  markdown(value: string): void;
+  progress(value: string): void;
+};
+
 type ToolExecutionContext = {
-  stream: vscode.ChatResponseStream;
+  stream: AgentStream;
   token: vscode.CancellationToken;
 };
 
@@ -175,12 +223,347 @@ const TOOL_DECLARATIONS = [
 
 let extensionContextRef: vscode.ExtensionContext | undefined;
 
+class GeminiSidebarProvider implements vscode.WebviewViewProvider {
+  private view?: vscode.WebviewView;
+  private readonly chatLog: ChatLogMessage[] = [];
+  private readonly conversation: GeminiContent[] = [];
+  private activeRequest?: vscode.CancellationTokenSource;
+
+  constructor(private readonly extensionUri: vscode.Uri) {}
+
+  resolveWebviewView(view: vscode.WebviewView): void {
+    this.view = view;
+    view.webview.options = {
+      enableScripts: true
+    };
+    view.webview.html = this.getHtml(view.webview);
+    view.webview.onDidReceiveMessage(async (message) => {
+      if (message.type === "send") {
+        await this.handlePrompt(String(message.text ?? ""));
+      } else if (message.type === "reset") {
+        this.reset();
+      } else if (message.type === "setApiKey") {
+        await promptAndStoreApiKey();
+        this.postState();
+      } else if (message.type === "setBaseUrl") {
+        await promptAndStoreBaseUrl();
+        this.postState();
+      } else if (message.type === "stop") {
+        this.activeRequest?.cancel();
+      }
+    });
+    this.postState();
+  }
+
+  async reveal(): Promise<void> {
+    await vscode.commands.executeCommand("workbench.view.extension.geminiAgent");
+    await vscode.commands.executeCommand(`${WEBVIEW_ID}.focus`);
+  }
+
+  reset(): void {
+    this.activeRequest?.cancel();
+    this.chatLog.length = 0;
+    this.conversation.length = 0;
+    this.chatLog.push({
+      role: "system",
+      text: "Session reset."
+    });
+    this.postState(false);
+  }
+
+  private async handlePrompt(text: string): Promise<void> {
+    const trimmed = text.trim();
+    if (!trimmed) {
+      return;
+    }
+
+    await ensureProviderConfigInteractive();
+
+    const cancellation = new vscode.CancellationTokenSource();
+    this.activeRequest?.cancel();
+    this.activeRequest = cancellation;
+
+    this.chatLog.push({ role: "user", text: trimmed });
+    this.postState(true);
+
+    const prompt = trimmed;
+    this.conversation.push({
+      role: "user",
+      parts: [{ text: prompt }]
+    });
+
+    const replyIndex = this.chatLog.push({ role: "assistant", text: "" }) - 1;
+    const sink = this.createWebviewStream(replyIndex);
+
+    try {
+      await runGeminiConversation(this.conversation, sink, cancellation.token);
+      if (!this.chatLog[replyIndex].text.trim()) {
+        this.chatLog[replyIndex].text = "No response.";
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!this.chatLog[replyIndex].text.trim()) {
+        this.chatLog[replyIndex].text = `Error: ${message}`;
+      } else {
+        this.chatLog[replyIndex].text += `\n\nError: ${message}`;
+      }
+    } finally {
+      if (this.activeRequest === cancellation) {
+        this.activeRequest = undefined;
+      }
+      this.postState(false);
+      cancellation.dispose();
+    }
+  }
+
+  private createWebviewStream(replyIndex: number): AgentStream {
+    return {
+      markdown: (value: string) => {
+        this.chatLog[replyIndex].text += value;
+        this.postState(true);
+      },
+      progress: (value: string) => {
+        this.postState(true, value);
+      }
+    };
+  }
+
+  private postState(busy = false, status?: string): void {
+    this.view?.webview.postMessage({
+      type: "state",
+      messages: this.chatLog,
+      busy,
+      status: status ?? (busy ? "Working..." : "Ready"),
+      hasApiKey: undefined
+    });
+  }
+
+  private getHtml(webview: vscode.Webview): string {
+    const nonce = getNonce();
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';" />
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0a1020;
+      --panel: #10182c;
+      --panel-2: #18233d;
+      --border: rgba(148, 163, 184, 0.18);
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #7dd3fc;
+      --accent-2: #38bdf8;
+      --user: #0f766e;
+      --assistant: #1d4ed8;
+      --system: #475569;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Consolas, "Courier New", monospace;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top, rgba(56, 189, 248, 0.18), transparent 32%),
+        linear-gradient(180deg, #08101c, var(--bg));
+      height: 100vh;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+    }
+    .header {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      background: rgba(10, 16, 32, 0.92);
+      backdrop-filter: blur(8px);
+    }
+    .title {
+      display: grid;
+      gap: 2px;
+    }
+    .title strong {
+      color: var(--accent);
+      font-size: 13px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    .title span {
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .actions {
+      display: flex;
+      gap: 8px;
+    }
+    button {
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--text);
+      border-radius: 10px;
+      padding: 7px 10px;
+      cursor: pointer;
+      font: inherit;
+    }
+    button.primary {
+      background: linear-gradient(180deg, rgba(56, 189, 248, 0.18), rgba(29, 78, 216, 0.28));
+      border-color: rgba(56, 189, 248, 0.35);
+    }
+    .messages {
+      overflow-y: auto;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .message {
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.5;
+      padding: 12px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+    }
+    .message[data-role="user"] {
+      background: rgba(15, 118, 110, 0.14);
+      border-left: 4px solid var(--user);
+    }
+    .message[data-role="assistant"] {
+      background: rgba(29, 78, 216, 0.12);
+      border-left: 4px solid var(--assistant);
+    }
+    .message[data-role="system"] {
+      color: var(--muted);
+      border-left: 4px solid var(--system);
+    }
+    .composer {
+      padding: 12px;
+      border-top: 1px solid var(--border);
+      display: grid;
+      gap: 10px;
+      background: rgba(10, 16, 32, 0.95);
+    }
+    textarea {
+      width: 100%;
+      min-height: 110px;
+      resize: vertical;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 12px;
+      color: var(--text);
+      background: var(--panel-2);
+      font: inherit;
+    }
+    .footer {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: center;
+    }
+    .status {
+      color: var(--muted);
+      font-size: 12px;
+      min-height: 16px;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="title">
+      <strong>Gemini Agent</strong>
+      <span>Separate sidebar chat with local file access</span>
+    </div>
+    <div class="actions">
+        <button id="setBaseUrl">Endpoint</button>
+        <button id="setApiKey">API Key</button>
+      <button id="reset">Reset</button>
+    </div>
+  </div>
+  <div class="messages" id="messages"></div>
+  <div class="composer">
+    <textarea id="input" placeholder="Ask Gemini to inspect, search, or change your files"></textarea>
+    <div class="footer">
+      <div class="status" id="status">Ready</div>
+      <div class="actions">
+        <button id="stop">Stop</button>
+        <button class="primary" id="send">Send</button>
+      </div>
+    </div>
+  </div>
+  <script nonce="${nonce}">
+    const vscode = acquireVsCodeApi();
+    const messagesEl = document.getElementById("messages");
+    const inputEl = document.getElementById("input");
+    const statusEl = document.getElementById("status");
+
+    function send() {
+      const text = inputEl.value;
+      if (!text.trim()) {
+        return;
+      }
+      vscode.postMessage({ type: "send", text });
+      inputEl.value = "";
+    }
+
+    document.getElementById("send").addEventListener("click", send);
+    document.getElementById("reset").addEventListener("click", () => vscode.postMessage({ type: "reset" }));
+    document.getElementById("setBaseUrl").addEventListener("click", () => vscode.postMessage({ type: "setBaseUrl" }));
+    document.getElementById("setApiKey").addEventListener("click", () => vscode.postMessage({ type: "setApiKey" }));
+    document.getElementById("stop").addEventListener("click", () => vscode.postMessage({ type: "stop" }));
+
+    inputEl.addEventListener("keydown", (event) => {
+      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+        send();
+      }
+    });
+
+    window.addEventListener("message", (event) => {
+      const data = event.data;
+      if (data.type !== "state") {
+        return;
+      }
+
+      statusEl.textContent = data.status;
+      messagesEl.innerHTML = "";
+      for (const message of data.messages) {
+        const item = document.createElement("div");
+        item.className = "message";
+        item.dataset.role = message.role;
+        item.textContent = message.text;
+        messagesEl.appendChild(item);
+      }
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    });
+  </script>
+</body>
+</html>`;
+  }
+}
+
 export function activate(context: vscode.ExtensionContext): void {
   extensionContextRef = context;
 
+  const sidebarProvider = new GeminiSidebarProvider(context.extensionUri);
+
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(WEBVIEW_ID, sidebarProvider, {
+      webviewOptions: {
+        retainContextWhenHidden: true
+      }
+    })
+  );
+
   const participant = vscode.chat.createChatParticipant(PARTICIPANT_ID, async (request, chatContext, stream, token) => {
     try {
-      await handleChatRequest(request, chatContext, stream, token);
+      await ensureProviderConfigInteractive();
+      const conversation = buildConversationFromChat(chatContext, request);
+      await runGeminiConversation(conversation, createChatResponseStream(stream), token);
       return {
         metadata: {
           model: getModel(),
@@ -202,18 +585,21 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand("geminiAgent.openChat", async () => {
-      await ensureApiKeyInteractive();
+      await ensureProviderConfigInteractive();
+      await sidebarProvider.reveal();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("geminiAgent.openNativeChat", async () => {
+      await ensureProviderConfigInteractive();
       await openNativeChat();
     })
   );
 
   context.subscriptions.push(
     vscode.commands.registerCommand("geminiAgent.resetSession", async () => {
-      try {
-        await vscode.commands.executeCommand("workbench.action.chat.new");
-      } catch {
-        await openNativeChat();
-      }
+      sidebarProvider.reset();
     })
   );
 
@@ -224,28 +610,97 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
+    vscode.commands.registerCommand("geminiAgent.setBaseUrl", async () => {
+      await promptAndStoreBaseUrl();
+    })
+  );
+
+  context.subscriptions.push(
     vscode.commands.registerCommand("geminiAgent.clearApiKey", async () => {
       if (!extensionContextRef) {
         return;
       }
-
       await extensionContextRef.secrets.delete(API_KEY_SECRET);
       void vscode.window.showInformationMessage("Gemini API key removed from secure storage.");
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("geminiAgent.clearBaseUrl", async () => {
+      if (!extensionContextRef) {
+        return;
+      }
+      await extensionContextRef.secrets.delete(BASE_URL_SECRET);
+      void vscode.window.showInformationMessage("Custom base URL removed.");
     })
   );
 }
 
 export function deactivate(): void {}
 
-async function handleChatRequest(
-  request: vscode.ChatRequest,
-  context: vscode.ChatContext,
-  stream: vscode.ChatResponseStream,
+function buildConversationFromChat(context: vscode.ChatContext, request: vscode.ChatRequest): GeminiContent[] {
+  const conversation: GeminiContent[] = [];
+
+  for (const turn of context.history) {
+    if (turn instanceof vscode.ChatRequestTurn) {
+      conversation.push({
+        role: "user",
+        parts: [{ text: turn.prompt }]
+      });
+      continue;
+    }
+
+    if (turn instanceof vscode.ChatResponseTurn && turn.participant === PARTICIPANT_ID) {
+      const text = turn.response
+        .filter((part): part is vscode.ChatResponseMarkdownPart => part instanceof vscode.ChatResponseMarkdownPart)
+        .map((part) => part.value.value)
+        .join("");
+
+      if (text.trim()) {
+        conversation.push({
+          role: "model",
+          parts: [{ text }]
+        });
+      }
+    }
+  }
+
+  conversation.push({
+    role: "user",
+    parts: [{ text: buildPromptWithReferences(request) }]
+  });
+
+  return conversation;
+}
+
+function buildPromptWithReferences(request: vscode.ChatRequest): string {
+  const lines = [request.prompt.trim()];
+
+  for (const reference of request.references) {
+    if (reference.value instanceof vscode.Uri) {
+      lines.push(`Referenced URI: ${reference.value.fsPath || reference.value.toString()}`);
+    } else if (reference.value instanceof vscode.Location) {
+      lines.push(`Referenced location: ${reference.value.uri.fsPath}:${reference.value.range.start.line + 1}`);
+    } else if (typeof reference.value === "string") {
+      lines.push(`Referenced value: ${reference.value}`);
+    }
+  }
+
+  return lines.filter(Boolean).join("\n");
+}
+
+function createChatResponseStream(stream: vscode.ChatResponseStream): AgentStream {
+  return {
+    markdown: (value: string) => stream.markdown(value),
+    progress: (value: string) => stream.progress(value)
+  };
+}
+
+async function runGeminiConversation(
+  conversation: GeminiContent[],
+  stream: AgentStream,
   token: vscode.CancellationToken
 ): Promise<void> {
-  await ensureApiKeyInteractive();
-  const conversation = buildConversation(context, request);
-
   for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration += 1) {
     throwIfCancelled(token);
     if (iteration === 0) {
@@ -270,6 +725,15 @@ async function handleChatRequest(
           throw new Error(candidate?.finishReason ? `Gemini finished without text: ${candidate.finishReason}` : "Gemini finished without text.");
         }
         stream.markdown(fallbackText);
+        conversation.push({
+          role: "model",
+          parts: [{ text: fallbackText }]
+        });
+      } else {
+        conversation.push({
+          role: "model",
+          parts: [{ text: finalText }]
+        });
       }
       return;
     }
@@ -298,68 +762,16 @@ async function handleChatRequest(
   throw new Error("Gemini exceeded the tool-call iteration limit.");
 }
 
-function buildConversation(context: vscode.ChatContext, request: vscode.ChatRequest): GeminiContent[] {
-  const conversation: GeminiContent[] = [];
-
-  for (const turn of context.history) {
-    if (turn instanceof vscode.ChatRequestTurn) {
-      conversation.push({
-        role: "user",
-        parts: [{ text: turn.prompt }]
-      });
-      continue;
-    }
-
-    if (turn instanceof vscode.ChatResponseTurn && turn.participant === PARTICIPANT_ID) {
-      const text = turn.response
-        .filter((part): part is vscode.ChatResponseMarkdownPart => part instanceof vscode.ChatResponseMarkdownPart)
-        .map((part) => part.value.value)
-        .join("");
-
-      if (text.trim()) {
-        conversation.push({
-          role: "model",
-          parts: [{ text }]
-        });
-      }
-    }
-  }
-
-  const prompt = buildPromptWithReferences(request);
-  conversation.push({
-    role: "user",
-    parts: [{ text: prompt }]
-  });
-
-  return conversation;
-}
-
-function buildPromptWithReferences(request: vscode.ChatRequest): string {
-  const lines = [request.prompt.trim()];
-
-  for (const reference of request.references) {
-    if (reference.value instanceof vscode.Uri) {
-      lines.push(`Referenced URI: ${reference.value.fsPath || reference.value.toString()}`);
-    } else if (reference.value instanceof vscode.Location) {
-      lines.push(`Referenced location: ${reference.value.uri.fsPath}:${reference.value.range.start.line + 1}`);
-    } else if (typeof reference.value === "string") {
-      lines.push(`Referenced value: ${reference.value}`);
-    }
-  }
-
-  return lines.filter(Boolean).join("\n");
-}
-
 async function generateGemini(contents: GeminiContent[], token: vscode.CancellationToken): Promise<GeminiResponse> {
   const response = await fetchGemini("generateContent", contents, token);
+  if (await isOpenAICompatibleMode()) {
+    const payload = (await response.json()) as OpenAIResponse;
+    return fromOpenAIResponse(payload);
+  }
   return (await response.json()) as GeminiResponse;
 }
 
-async function streamGemini(
-  contents: GeminiContent[],
-  stream: vscode.ChatResponseStream,
-  token: vscode.CancellationToken
-): Promise<string> {
+async function streamGemini(contents: GeminiContent[], stream: AgentStream, token: vscode.CancellationToken): Promise<string> {
   const response = await fetchGemini("streamGenerateContent?alt=sse", contents, token);
   const body = response.body;
 
@@ -384,54 +796,52 @@ async function streamGemini(
     while (separatorIndex !== -1) {
       const rawEvent = buffer.slice(0, separatorIndex);
       buffer = buffer.slice(separatorIndex + 2);
-
-      const data = rawEvent
-        .split(/\r?\n/)
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).trim())
-        .join("");
-
-      if (data && data !== "[DONE]") {
-        const payload = JSON.parse(data) as GeminiResponse;
-        const candidate = payload.candidates?.[0];
-        const content = candidate?.content;
-        if (content) {
-          for (const part of content.parts) {
-            if ("text" in part && part.text) {
-              aggregatedText += part.text;
-              stream.markdown(part.text);
-            }
-          }
-        }
-      }
-
+      aggregatedText += emitSseEvent(rawEvent, stream);
       separatorIndex = buffer.indexOf("\n\n");
     }
   }
 
   const trailing = buffer.trim();
   if (trailing.startsWith("data:")) {
-    const data = trailing
-      .split(/\r?\n/)
-      .filter((line) => line.startsWith("data:"))
-      .map((line) => line.slice(5).trim())
-      .join("");
-
-    if (data && data !== "[DONE]") {
-      const payload = JSON.parse(data) as GeminiResponse;
-      const content = payload.candidates?.[0]?.content;
-      if (content) {
-        for (const part of content.parts) {
-          if ("text" in part && part.text) {
-            aggregatedText += part.text;
-            stream.markdown(part.text);
-          }
-        }
-      }
-    }
+    aggregatedText += emitSseEvent(trailing, stream);
   }
 
   return aggregatedText;
+}
+
+function emitSseEvent(rawEvent: string, stream: AgentStream): string {
+  const data = rawEvent
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trim())
+    .join("");
+
+  if (!data || data === "[DONE]") {
+    return "";
+  }
+
+  const payload = JSON.parse(data) as GeminiResponse | OpenAIResponse;
+  if (isOpenAIChunk(payload)) {
+    const text = payload.choices?.[0]?.delta?.content ?? "";
+    if (text) {
+      stream.markdown(text);
+    }
+    return text;
+  }
+
+  const content = (payload as GeminiResponse).candidates?.[0]?.content;
+  if (!content) {
+    return "";
+  }
+
+  let text = "";
+  for (const part of content.parts) {
+    if ("text" in part && part.text) {
+      text += part.text;
+      stream.markdown(part.text);
+    }
+  }
+  return text;
 }
 
 async function fetchGemini(
@@ -439,6 +849,10 @@ async function fetchGemini(
   contents: GeminiContent[],
   token: vscode.CancellationToken
 ): Promise<Response> {
+  if (await isOpenAICompatibleMode()) {
+    return fetchOpenAICompatible(contents, endpoint === "streamGenerateContent?alt=sse", token);
+  }
+
   const apiKey = await getApiKey();
   const model = getModel();
   const controller = new AbortController();
@@ -468,6 +882,52 @@ async function fetchGemini(
     if (!response.ok) {
       const payload = (await response.json().catch(() => undefined)) as GeminiResponse | undefined;
       throw new Error(payload?.error?.message || `Gemini API request failed with status ${response.status}.`);
+    }
+
+    return response;
+  } finally {
+    subscription.dispose();
+  }
+}
+
+async function fetchOpenAICompatible(
+  contents: GeminiContent[],
+  stream: boolean,
+  token: vscode.CancellationToken
+): Promise<Response> {
+  const apiKey = await getApiKey();
+  const model = getModel();
+  const baseUrl = await getBaseUrl();
+  const controller = new AbortController();
+  const subscription = token.onCancellationRequested(() => controller.abort());
+
+  try {
+    const response = await fetch(joinUrl(baseUrl, "/v1/chat/completions"), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model,
+        messages: toOpenAIMessages(contents),
+        tools: TOOL_DECLARATIONS.map((tool) => ({
+          type: "function",
+          function: {
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.parameters
+          }
+        })),
+        tool_choice: "auto",
+        stream
+      }),
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      const payload = (await response.json().catch(() => undefined)) as OpenAIResponse | undefined;
+      throw new Error(payload?.error?.message || `OpenAI-compatible API request failed with status ${response.status}.`);
     }
 
     return response;
@@ -715,6 +1175,108 @@ function getFunctionCalls(content: GeminiContent): Array<{ id?: string; name: st
     .filter((part): part is NonNullable<typeof part> => Boolean(part));
 }
 
+function toOpenAIMessages(contents: GeminiContent[]): OpenAIChatMessage[] {
+  const messages: OpenAIChatMessage[] = [
+    {
+      role: "system",
+      content: SYSTEM_PROMPT
+    }
+  ];
+
+  for (const content of contents) {
+    const text = content.parts.filter((part): part is GeminiTextPart => "text" in part).map((part) => part.text).join("");
+    const functionCalls = content.parts
+      .filter((part): part is GeminiFunctionCallPart => "functionCall" in part)
+      .map((part) => part.functionCall);
+    const functionResponses = content.parts
+      .filter((part): part is GeminiFunctionResponsePart => "functionResponse" in part)
+      .map((part) => part.functionResponse);
+
+    if (content.role === "model") {
+      if (functionCalls.length > 0) {
+        messages.push({
+          role: "assistant",
+          content: text || null,
+          tool_calls: functionCalls.map((call, index) => ({
+            id: call.id ?? `tool_call_${Date.now()}_${index}`,
+            type: "function",
+            function: {
+              name: call.name,
+              arguments: JSON.stringify(call.args ?? {})
+            }
+          }))
+        });
+      } else {
+        messages.push({
+          role: "assistant",
+          content: text
+        });
+      }
+      continue;
+    }
+
+    if (functionResponses.length > 0) {
+      for (const response of functionResponses) {
+        messages.push({
+          role: "tool",
+          tool_call_id: response.id ?? `tool_result_${Date.now()}`,
+          content: JSON.stringify(response.response)
+        });
+      }
+    } else {
+      messages.push({
+        role: "user",
+        content: text
+      });
+    }
+  }
+
+  return messages;
+}
+
+function fromOpenAIResponse(payload: OpenAIResponse): GeminiResponse {
+  const message = payload.choices?.[0]?.message;
+  const parts: GeminiPart[] = [];
+
+  if (message?.content) {
+    parts.push({ text: message.content });
+  }
+
+  for (const toolCall of message?.tool_calls ?? []) {
+    let args: Record<string, unknown> | undefined;
+    try {
+      args = JSON.parse(toolCall.function.arguments || "{}") as Record<string, unknown>;
+    } catch {
+      args = {};
+    }
+
+    parts.push({
+      functionCall: {
+        id: toolCall.id,
+        name: toolCall.function.name,
+        args
+      }
+    });
+  }
+
+  return {
+    candidates: [
+      {
+        content: {
+          role: "model",
+          parts
+        },
+        finishReason: payload.choices?.[0]?.finish_reason ?? undefined
+      }
+    ],
+    error: payload.error
+  };
+}
+
+function isOpenAIChunk(payload: GeminiResponse | OpenAIResponse): payload is OpenAIResponse {
+  return Array.isArray((payload as OpenAIResponse).choices) && !(payload as GeminiResponse).candidates;
+}
+
 function getTextFromContent(content: GeminiContent): string {
   return content.parts.map((part) => ("text" in part ? part.text : "")).join("");
 }
@@ -780,19 +1342,50 @@ async function ensureApiKeyInteractive(): Promise<void> {
     return;
   }
 
-  const action = await vscode.window.showInformationMessage(
-    "Gemini API key is not configured.",
-    "Set API Key"
-  );
-
+  const action = await vscode.window.showInformationMessage("Gemini API key is not configured.", "Set API Key");
   if (action === "Set API Key") {
     await promptAndStoreApiKey();
   }
 }
 
+async function ensureProviderConfigInteractive(): Promise<void> {
+  if (await isOpenAICompatibleMode()) {
+    const baseUrl = await getBaseUrlOptional();
+    if (!baseUrl) {
+      const action = await vscode.window.showInformationMessage("Base URL is not configured for OpenAI-compatible mode.", "Set Base URL");
+      if (action === "Set Base URL") {
+        await promptAndStoreBaseUrl();
+      }
+    }
+  }
+
+  await ensureApiKeyInteractive();
+}
+
 async function getApiKeyOptional(): Promise<string | undefined> {
   const secretApiKey = extensionContextRef ? await extensionContextRef.secrets.get(API_KEY_SECRET) : undefined;
   return secretApiKey || vscode.workspace.getConfiguration("geminiAgent").get<string>("apiKey") || process.env.GEMINI_API_KEY || undefined;
+}
+
+async function getBaseUrl(): Promise<string> {
+  const baseUrl = await getBaseUrlOptional();
+  if (!baseUrl) {
+    throw new Error("Base URL is not configured. Run 'Gemini Agent: Set Base URL'.");
+  }
+  return baseUrl;
+}
+
+async function getBaseUrlOptional(): Promise<string | undefined> {
+  const secretBaseUrl = extensionContextRef ? await extensionContextRef.secrets.get(BASE_URL_SECRET) : undefined;
+  return secretBaseUrl || vscode.workspace.getConfiguration("geminiAgent").get<string>("baseUrl") || process.env.GEMINI_BASE_URL || undefined;
+}
+
+async function isOpenAICompatibleMode(): Promise<boolean> {
+  const style = vscode.workspace.getConfiguration("geminiAgent").get<string>("apiStyle", "gemini");
+  if (style === "openai-compatible") {
+    return true;
+  }
+  return false;
 }
 
 async function promptAndStoreApiKey(): Promise<void> {
@@ -821,4 +1414,44 @@ async function promptAndStoreApiKey(): Promise<void> {
 
   await extensionContextRef.secrets.store(API_KEY_SECRET, trimmed);
   void vscode.window.showInformationMessage("Gemini API key saved in secure storage.");
+}
+
+async function promptAndStoreBaseUrl(): Promise<void> {
+  if (!extensionContextRef) {
+    throw new Error("Extension context is not initialized.");
+  }
+
+  const existing = await getBaseUrlOptional();
+  const input = await vscode.window.showInputBox({
+    title: "API Base URL",
+    prompt: "Paste your OpenAI-compatible base URL",
+    ignoreFocusOut: true,
+    placeHolder: "https://agent.timeweb.cloud/api/v1/cloud-ai/agents/<agent_id>",
+    value: existing ?? ""
+  });
+
+  if (input === undefined) {
+    return;
+  }
+
+  const trimmed = input.trim().replace(/\/+$/, "");
+  if (!trimmed) {
+    throw new Error("Base URL input was empty.");
+  }
+
+  await extensionContextRef.secrets.store(BASE_URL_SECRET, trimmed);
+  void vscode.window.showInformationMessage("API base URL saved in secure storage.");
+}
+
+function joinUrl(base: string, suffix: string): string {
+  return `${base.replace(/\/+$/, "")}${suffix.startsWith("/") ? suffix : `/${suffix}`}`;
+}
+
+function getNonce(): string {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  let result = "";
+  for (let i = 0; i < 16; i += 1) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
 }
