@@ -1,0 +1,6 @@
+out/test/**
+src/**
+tsconfig.json
+**/*.map
+**/.gitignore
+README.dev.md

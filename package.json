@@ -1,0 +1,92 @@
+{
+  "name": "gemini-vscode-agent",
+  "displayName": "Gemini VS Code Agent",
+  "description": "VS Code extension that connects Gemini API to a file-aware coding agent.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.91.0"
+  },
+  "categories": [
+    "Other",
+    "AI",
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onCommand:geminiAgent.openChat",
+    "onCommand:geminiAgent.resetSession",
+    "onCommand:geminiAgent.setApiKey",
+    "onCommand:geminiAgent.clearApiKey",
+    "onChatParticipant:local.gemini-vscode-agent"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "geminiAgent.openChat",
+        "title": "Gemini Agent: Open Chat"
+      },
+      {
+        "command": "geminiAgent.resetSession",
+        "title": "Gemini Agent: Reset Session"
+      },
+      {
+        "command": "geminiAgent.setApiKey",
+        "title": "Gemini Agent: Set API Key"
+      },
+      {
+        "command": "geminiAgent.clearApiKey",
+        "title": "Gemini Agent: Clear API Key"
+      }
+    ],
+    "chatParticipants": [
+      {
+        "id": "local.gemini-vscode-agent",
+        "name": "gemini",
+        "fullName": "Gemini Agent",
+        "description": "Ask Gemini to inspect and edit files in your workspace.",
+        "isSticky": true
+      }
+    ],
+    "configuration": {
+      "title": "Gemini Agent",
+      "properties": {
+        "geminiAgent.apiKey": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Gemini API key. If empty, the extension will also check the `GEMINI_API_KEY` environment variable."
+        },
+        "geminiAgent.model": {
+          "type": "string",
+          "default": "gemini-2.5-flash",
+          "description": "Gemini model passed to the generateContent API."
+        },
+        "geminiAgent.allowOutsideWorkspace": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow the agent to read and write absolute paths outside the currently opened workspace."
+        },
+        "geminiAgent.confirmDangerousWrites": {
+          "type": "boolean",
+          "default": true,
+          "description": "Ask for confirmation before overwriting files or writing outside the current workspace."
+        },
+        "geminiAgent.maxFileBytes": {
+          "type": "number",
+          "default": 200000,
+          "minimum": 4096,
+          "description": "Maximum file size the agent can read in one tool call."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.5.4"
+  }
+}
