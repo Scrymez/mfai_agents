@@ -35,9 +35,18 @@ npm run compile
 - переменная окружения `GEMINI_API_KEY`
 
 5. Нажмите на иконку `Gemini Agent` в Activity Bar слева или выполните команду `Gemini Agent: Open Chat`.
-6. Для встроенного чата VS Code по-прежнему доступен `@gemini` через команду `Gemini Agent: Open Native Chat`.
+6. При первом открытии расширение покажет встроенный экран `Setup`.
+7. Заполните внутри расширения:
 
-Если ключ не задан, расширение само покажет окно ввода и предложит вставить API key.
+- `API Style`
+- `Model`
+- `Base URL`, если выбран `openai-compatible`
+- `API Key / Auth Token`
+
+8. Нажмите `Save Setup`.
+9. После этого расширение сохранит настройки и переключится в обычный чат.
+
+Для встроенного чата VS Code по-прежнему доступен `@gemini` через команду `Gemini Agent: Open Native Chat`.
 
 ## Timeweb Cloud
 

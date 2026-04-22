@@ -242,11 +242,21 @@ class GeminiSidebarProvider implements vscode.WebviewViewProvider {
         await this.handlePrompt(String(message.text ?? ""));
       } else if (message.type === "reset") {
         this.reset();
-      } else if (message.type === "setApiKey") {
-        await promptAndStoreApiKey();
-        this.postState();
-      } else if (message.type === "setBaseUrl") {
-        await promptAndStoreBaseUrl();
+      } else if (message.type === "saveSetup") {
+        await saveProviderSetup({
+          apiStyle: String(message.apiStyle ?? "gemini"),
+          model: String(message.model ?? DEFAULT_MODEL),
+          apiKey: String(message.apiKey ?? ""),
+          baseUrl: typeof message.baseUrl === "string" ? message.baseUrl : undefined
+        });
+        if (this.chatLog.length === 0) {
+          this.chatLog.push({
+            role: "system",
+            text: "Setup saved. You can start chatting."
+          });
+        }
+        this.postState(false, "Setup saved.");
+      } else if (message.type === "openSetup") {
         this.postState();
       } else if (message.type === "stop") {
         this.activeRequest?.cancel();
@@ -277,7 +287,10 @@ class GeminiSidebarProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    await ensureProviderConfigInteractive();
+    if (!(await hasMinimumProviderConfig())) {
+      this.postState(false, "Setup required");
+      return;
+    }
 
     const cancellation = new vscode.CancellationTokenSource();
     this.activeRequest?.cancel();
@@ -329,12 +342,17 @@ class GeminiSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private postState(busy = false, status?: string): void {
+    void this.postStateAsync(busy, status);
+  }
+
+  private async postStateAsync(busy = false, status?: string): Promise<void> {
+    const setup = await getProviderSetupState();
     this.view?.webview.postMessage({
       type: "state",
       messages: this.chatLog,
       busy,
-      status: status ?? (busy ? "Working..." : "Ready"),
-      hasApiKey: undefined
+      status: status ?? (busy ? "Working..." : setup.isConfigured ? "Ready" : "Setup required"),
+      setup
     });
   }
 
@@ -421,6 +439,49 @@ class GeminiSidebarProvider implements vscode.WebviewViewProvider {
       flex-direction: column;
       gap: 12px;
     }
+    .setup {
+      overflow-y: auto;
+      padding: 14px;
+    }
+    .setup-card {
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 16px;
+      background: linear-gradient(180deg, rgba(16, 24, 44, 0.98), rgba(24, 35, 61, 0.94));
+      display: grid;
+      gap: 12px;
+    }
+    .setup-title {
+      color: var(--accent);
+      font-size: 14px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .setup-text {
+      color: var(--muted);
+      line-height: 1.5;
+    }
+    .field {
+      display: grid;
+      gap: 6px;
+    }
+    .field span {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .field input, .field select {
+      width: 100%;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 10px 12px;
+      color: var(--text);
+      background: var(--panel-2);
+      font: inherit;
+    }
+    .setup-actions {
+      display: flex;
+      justify-content: flex-end;
+    }
     .message {
       white-space: pre-wrap;
       word-break: break-word;
@@ -477,16 +538,43 @@ class GeminiSidebarProvider implements vscode.WebviewViewProvider {
   <div class="header">
     <div class="title">
       <strong>Gemini Agent</strong>
-      <span>Separate sidebar chat with local file access</span>
+      <span id="subtitle">Separate sidebar chat with local file access</span>
     </div>
     <div class="actions">
-        <button id="setBaseUrl">Endpoint</button>
-        <button id="setApiKey">API Key</button>
+      <button id="openSetup">Setup</button>
       <button id="reset">Reset</button>
     </div>
   </div>
+  <div class="setup" id="setup" style="display:none;">
+    <div class="setup-card">
+      <div class="setup-title">First-time setup</div>
+      <div class="setup-text">Enter provider data once. The extension will save it and then switch to normal chat mode.</div>
+      <label class="field">
+        <span>API Style</span>
+        <select id="apiStyle">
+          <option value="gemini">Gemini</option>
+          <option value="openai-compatible">OpenAI-compatible</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Model</span>
+        <input id="model" type="text" placeholder="gemini-2.5-flash" />
+      </label>
+      <label class="field" id="baseUrlField">
+        <span>Base URL</span>
+        <input id="baseUrl" type="text" placeholder="https://agent.timeweb.cloud/..." />
+      </label>
+      <label class="field">
+        <span>API Key / Auth Token</span>
+        <input id="apiKey" type="password" placeholder="Paste your API key or auth token" />
+      </label>
+      <div class="setup-actions">
+        <button class="primary" id="saveSetup">Save Setup</button>
+      </div>
+    </div>
+  </div>
   <div class="messages" id="messages"></div>
-  <div class="composer">
+  <div class="composer" id="composer">
     <textarea id="input" placeholder="Ask Gemini to inspect, search, or change your files"></textarea>
     <div class="footer">
       <div class="status" id="status">Ready</div>
@@ -501,6 +589,14 @@ class GeminiSidebarProvider implements vscode.WebviewViewProvider {
     const messagesEl = document.getElementById("messages");
     const inputEl = document.getElementById("input");
     const statusEl = document.getElementById("status");
+    const setupEl = document.getElementById("setup");
+    const composerEl = document.getElementById("composer");
+    const subtitleEl = document.getElementById("subtitle");
+    const apiStyleEl = document.getElementById("apiStyle");
+    const modelEl = document.getElementById("model");
+    const baseUrlEl = document.getElementById("baseUrl");
+    const apiKeyEl = document.getElementById("apiKey");
+    const baseUrlFieldEl = document.getElementById("baseUrlField");
 
     function send() {
       const text = inputEl.value;
@@ -511,11 +607,25 @@ class GeminiSidebarProvider implements vscode.WebviewViewProvider {
       inputEl.value = "";
     }
 
+    function syncSetup() {
+      baseUrlFieldEl.style.display = apiStyleEl.value === "openai-compatible" ? "grid" : "none";
+    }
+
     document.getElementById("send").addEventListener("click", send);
     document.getElementById("reset").addEventListener("click", () => vscode.postMessage({ type: "reset" }));
-    document.getElementById("setBaseUrl").addEventListener("click", () => vscode.postMessage({ type: "setBaseUrl" }));
-    document.getElementById("setApiKey").addEventListener("click", () => vscode.postMessage({ type: "setApiKey" }));
+    document.getElementById("openSetup").addEventListener("click", () => vscode.postMessage({ type: "openSetup" }));
     document.getElementById("stop").addEventListener("click", () => vscode.postMessage({ type: "stop" }));
+    document.getElementById("saveSetup").addEventListener("click", () => {
+      vscode.postMessage({
+        type: "saveSetup",
+        apiStyle: apiStyleEl.value,
+        model: modelEl.value,
+        baseUrl: baseUrlEl.value,
+        apiKey: apiKeyEl.value
+      });
+      apiKeyEl.value = "";
+    });
+    apiStyleEl.addEventListener("change", syncSetup);
 
     inputEl.addEventListener("keydown", (event) => {
       if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
@@ -530,6 +640,17 @@ class GeminiSidebarProvider implements vscode.WebviewViewProvider {
       }
 
       statusEl.textContent = data.status;
+      const setup = data.setup || {};
+      const showSetup = !setup.isConfigured || data.status === "Setup required";
+      setupEl.style.display = showSetup ? "block" : "none";
+      messagesEl.style.display = showSetup ? "none" : "flex";
+      composerEl.style.display = showSetup ? "none" : "grid";
+      subtitleEl.textContent = showSetup ? "Complete setup once, then chat normally" : "Separate sidebar chat with local file access";
+      apiStyleEl.value = setup.apiStyle || "gemini";
+      modelEl.value = setup.model || "gemini-2.5-flash";
+      baseUrlEl.value = setup.baseUrl || "";
+      syncSetup();
+
       messagesEl.innerHTML = "";
       for (const message of data.messages) {
         const item = document.createElement("div");
@@ -585,7 +706,6 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand("geminiAgent.openChat", async () => {
-      await ensureProviderConfigInteractive();
       await sidebarProvider.reveal();
     })
   );
@@ -1362,6 +1482,70 @@ async function ensureProviderConfigInteractive(): Promise<void> {
   await ensureApiKeyInteractive();
 }
 
+async function hasMinimumProviderConfig(): Promise<boolean> {
+  const apiKey = await getApiKeyOptional();
+  if (!apiKey) {
+    return false;
+  }
+
+  if (await isOpenAICompatibleMode()) {
+    const baseUrl = await getBaseUrlOptional();
+    return Boolean(baseUrl);
+  }
+
+  return true;
+}
+
+async function getProviderSetupState(): Promise<{
+  isConfigured: boolean;
+  apiStyle: string;
+  model: string;
+  baseUrl: string;
+}> {
+  const apiStyle = getApiStyle();
+  const model = getModel();
+  const baseUrl = (await getBaseUrlOptional()) ?? "";
+  return {
+    isConfigured: await hasMinimumProviderConfig(),
+    apiStyle,
+    model,
+    baseUrl
+  };
+}
+
+async function saveProviderSetup(input: {
+  apiStyle: string;
+  model: string;
+  apiKey: string;
+  baseUrl?: string;
+}): Promise<void> {
+  if (!extensionContextRef) {
+    throw new Error("Extension context is not initialized.");
+  }
+
+  const apiStyle = input.apiStyle === "openai-compatible" ? "openai-compatible" : "gemini";
+  const model = input.model.trim() || DEFAULT_MODEL;
+  const apiKey = input.apiKey.trim();
+  const baseUrl = (input.baseUrl ?? "").trim();
+
+  if (!apiKey) {
+    throw new Error("API key is required.");
+  }
+  if (apiStyle === "openai-compatible" && !baseUrl) {
+    throw new Error("Base URL is required for OpenAI-compatible mode.");
+  }
+
+  await vscode.workspace.getConfiguration("geminiAgent").update("apiStyle", apiStyle, vscode.ConfigurationTarget.Global);
+  await vscode.workspace.getConfiguration("geminiAgent").update("model", model, vscode.ConfigurationTarget.Global);
+  await extensionContextRef.secrets.store(API_KEY_SECRET, apiKey);
+
+  if (apiStyle === "openai-compatible") {
+    await extensionContextRef.secrets.store(BASE_URL_SECRET, baseUrl.replace(/\/+$/, ""));
+  } else {
+    await extensionContextRef.secrets.delete(BASE_URL_SECRET);
+  }
+}
+
 async function getApiKeyOptional(): Promise<string | undefined> {
   const secretApiKey = extensionContextRef ? await extensionContextRef.secrets.get(API_KEY_SECRET) : undefined;
   return secretApiKey || vscode.workspace.getConfiguration("geminiAgent").get<string>("apiKey") || process.env.GEMINI_API_KEY || undefined;
@@ -1381,11 +1565,11 @@ async function getBaseUrlOptional(): Promise<string | undefined> {
 }
 
 async function isOpenAICompatibleMode(): Promise<boolean> {
-  const style = vscode.workspace.getConfiguration("geminiAgent").get<string>("apiStyle", "gemini");
-  if (style === "openai-compatible") {
-    return true;
-  }
-  return false;
+  return getApiStyle() === "openai-compatible";
+}
+
+function getApiStyle(): string {
+  return vscode.workspace.getConfiguration("geminiAgent").get<string>("apiStyle", "gemini");
 }
 
 async function promptAndStoreApiKey(): Promise<void> {
